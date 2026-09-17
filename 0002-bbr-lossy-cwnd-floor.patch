@@ -1,0 +1,63 @@
+From 68198c82cee895d27a3fbbbd3596d6fe62fdee90 Mon Sep 17 00:00:00 2001
+From: Junyu Zhao <junyuz@usc.edu>
+Date: Thu, 17 Sep 2026 08:55:21 +0000
+Subject: [PATCH] EE542: add configurable BBR cwnd floor for lossy links
+
+---
+ net/ipv4/tcp_bbr.c | 32 +++++++++++++++++++++++++++-----
+ 1 file changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+index 760941e55..47b2c6e5c 100644
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@ -173,7 +173,17 @@ static const u32 bbr_cycle_rand = 7;
+  * needs at least 4 packets in flight:
+  */
+ static const u32 bbr_cwnd_min_target = 4;
+-
++/*
++ * EE542 lossy-link experiment:
++ * Keep a larger congestion window on high-RTT links where
++ * random packet loss is not necessarily caused by congestion.
++ *
++ * This floor does not apply during BBR_PROBE_RTT.
++ */
++static unsigned int bbr_lossy_cwnd_floor = 256;
++module_param(bbr_lossy_cwnd_floor, uint, 0644);
++MODULE_PARM_DESC(bbr_lossy_cwnd_floor,
++		 "Minimum BBR cwnd in packets for EE542 lossy-link experiments");
+ /* To estimate if BBR_STARTUP mode (i.e. high_gain) has filled pipe... */
+ /* If bw has increased significantly (1.25x), there may be more bw available: */
+ static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;
+@@ -545,11 +555,23 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
+ 	cwnd = max(cwnd, bbr_cwnd_min_target);
+ 
+ done:
+-	tcp_snd_cwnd_set(tp, min(cwnd, tp->snd_cwnd_clamp));	/* apply global cap */
+-	if (bbr->mode == BBR_PROBE_RTT)  /* drain queue, refresh min_rtt */
+-		tcp_snd_cwnd_set(tp, min(tcp_snd_cwnd(tp), bbr_cwnd_min_target));
+-}
++/*
++	 * EE542: random link loss should not force the sending
++	 * window to collapse to a tiny value. Preserve the normal
++	 * BBR PROBE_RTT behavior, but apply a configurable cwnd
++	 * floor during normal operation.
++	 */
++	if (bbr->mode != BBR_PROBE_RTT)
++		cwnd = max_t(u32, cwnd,
++			     READ_ONCE(bbr_lossy_cwnd_floor));
++
++	tcp_snd_cwnd_set(tp, min(cwnd, tp->snd_cwnd_clamp));
+ 
++	if (bbr->mode == BBR_PROBE_RTT)
++		tcp_snd_cwnd_set(tp,
++				 min(tcp_snd_cwnd(tp),
++				     bbr_cwnd_min_target));
++}
+ /* End cycle phase if it's time and/or we hit the phase's in-flight target. */
+ static bool bbr_is_next_cycle_phase(struct sock *sk,
+ 				    const struct rate_sample *rs)
+-- 
+2.43.0
+
