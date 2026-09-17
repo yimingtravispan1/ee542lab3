@@ -1,0 +1,28 @@
+From b3dd92c94b3f297e0f8dd4a553cbe9dda1437664 Mon Sep 17 00:00:00 2001
+From: Junyu Zhao <junyuz@usc.edu>
+Date: Wed, 16 Sep 2026 09:09:41 +0000
+Subject: [PATCH] EE542: enable linear RTO for established TCP connections
+
+---
+ net/ipv4/tcp_timer.c | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index a20787727..6f0e7063c 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -660,10 +660,7 @@ void tcp_retransmit_timer(struct sock *sk)
+ 	 * exponential backoff behaviour to avoid continue hammering
+ 	 * linear-timeout retransmissions into a black hole
+ 	 */
+-	if (sk->sk_state == TCP_ESTABLISHED &&
+-	    (tp->thin_lto || READ_ONCE(net->ipv4.sysctl_tcp_thin_linear_timeouts)) &&
+-	    tcp_stream_is_thin(tp) &&
+-	    icsk->icsk_retransmits <= TCP_THIN_LINEAR_RETRIES) {
++	if (sk->sk_state == TCP_ESTABLISHED) {
+ 		icsk->icsk_backoff = 0;
+ 		icsk->icsk_rto = clamp(__tcp_set_rto(tp),
+ 				       tcp_rto_min(sk),
+-- 
+2.53.0
+
