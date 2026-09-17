@@ -28,7 +28,7 @@
 
 ### 2. AWS Architecture and Concepts
 
-A VPC is an isolated virtual network, and subnets divide its address space into separate network segments. An Internet Gateway connects the VPC to the Internet. Route tables determine where subnet traffic is forwarded. Security groups are stateful filters for instances and ENIs, while Network ACLs are stateless filters applied to subnets. An ENI is a virtual network interface with private IP addresses and security groups. An Elastic IP is a public address mapped by AWS to a private IP on an ENI. The Client and Server used separate NICs for experimental traffic and SSH/Internet access. Source/destination checking was disabled on VyOS because it forwards packets between the Client and Server subnets.
+A VPC is an isolated virtual network, and subnets divide its address space into separate network segments. An Internet Gateway connects the VPC to the Internet. Route tables determine where subnet traffic is forwarded. Security groups are stateful filters for instances and ENIs, while Network ACLs are stateless filters applied to subnets. An ENI is a virtual network interface with private IP addresses and security groups. An Elastic IP is a public address mapped by AWS to a private IP on an ENI. The Client and Server used separate NICs for experimental traffic and SSH/Internet access. AWS source/destination checking requires an instance to be the source or destination of traffic passing through its ENI. It was disabled on VyOS because the router forwards packets between other hosts.
 
 ---
 
@@ -283,3 +283,73 @@ The NIC is virtual hardware controlled by AWS, not a physical adapter whose spee
 ### 13. Conclusion
 
 The Client–VyOS–Server topology forwarded traffic successfully with 0% ping loss. Baseline TCP reached 4.96 Gbit/s; 100 ms delay and 10% loss greatly reduced TCP throughput, while TBF limited both TCP and UDP receiver throughput to about 100 Mbit/s.
+
+# Part 2 — Fast and Reliable File Transfer in the Cloud
+
+## 1. Test Setup
+
+The sender transferred a 1 GiB file using the Lab 2 reliable-UDP program with an 8,192-packet window. MTU 1500 used a 1,400-byte payload and MTU 9001 used an 8,900-byte payload. `iperf3` and `ping` were run as reference measurements.
+
+The three cases follow the Lab 2 target conditions: Case 1 uses 10 ms RTT, 1% loss per direction, and a 100 Mbit/s rate limit; Case 2 uses 200 ms RTT, 20% loss per direction, and a 100 Mbit/s rate limit; Case 3 uses 200 ms RTT, no random loss, 100 Mbit/s client/server limits, and an 80 Mbit/s router limit. UDP sending and file-transfer pacing were set to 95 Mbit/s for Cases 1–2 and 75 Mbit/s for Case 3. Ping loss is a round-trip measurement, whereas iperf3 UDP loss is measured in one direction.
+
+## 2. Results
+
+### Case 1 — Low-latency path (about 10–13 ms RTT)
+
+| MTU | Ping loss / avg RTT | iperf3 UDP receiver | iperf3 TCP receiver | Reliable UDP transfer |
+|---:|---|---|---|---|
+| 1500 | 0% / 12.859 ms | 93.9 Mbit/s; 1.1% loss | 11.5 Mbit/s; 101 retransmissions | 97.527 s; 88.08 Mbit/s; 15,340 retransmissions |
+| 9001 | 2.5% / 10.546 ms | 94.0 Mbit/s; 0.91% loss | 11.6 Mbit/s; 45 retransmissions | 91.288 s; 94.10 Mbit/s; 113 retransmissions |
+
+Jumbo frames improved the reliable-UDP throughput by about 6 Mbit/s and substantially reduced retransmissions.
+
+![Case 1 reliable UDP, MTU 1500](images/part2/case1_mtu1500_custom_transfer_sender.png)
+
+![Case 1 reliable UDP, MTU 9001](images/part2/case1_mtu9001_custom_transfer_sender.png)
+
+### Case 2 — High-delay, lossy path (about 200 ms RTT)
+
+| MTU | Ping loss / avg RTT | iperf3 UDP receiver | iperf3 TCP receiver | Reliable UDP transfer |
+|---:|---|---|---|---|
+| 1500 | 40% / 200.587 ms | 62.1 Mbit/s; 21% loss | 52.5 Kbit/s; 17 retransmissions | 152.192 s; 56.44 Mbit/s; 430,572 retransmissions |
+| 9001 | 30% / 200.564 ms | 74.5 Mbit/s; 20% loss | 206 Kbit/s; 25 retransmissions | 146.011 s; 58.83 Mbit/s; 68,045 retransmissions |
+
+Loss and long delay severely reduced TCP performance. The reliable-UDP program completed in both MTU settings; MTU 9001 was faster and required fewer retransmissions, although its FIN handshake timed out three times.
+
+![Case 2 reliable UDP, MTU 1500](images/part2/case2_mtu1500_custom_transfer_sender.png)
+
+![Case 2 reliable UDP, MTU 9001](images/part2/case2_mtu9001_custom_transfer_sender.png)
+
+### Case 3 — High-delay, loss-free path (about 200 ms RTT)
+
+| MTU | Ping loss / avg RTT | iperf3 UDP receiver | iperf3 TCP receiver | Reliable UDP transfer |
+|---:|---|---|---|---|
+| 1500 | 0% / 200.552 ms | 73.5 Mbit/s; 0% loss | 15.0 Mbit/s; 0 retransmissions | 120.838 s; 71.09 Mbit/s; 2 retransmissions |
+| 9001 | 0% / 200.622 ms | 73.5 Mbit/s; 0% loss | 719 Kbit/s; 20 retransmissions | 116.318 s; 73.85 Mbit/s; 83 retransmissions |
+
+With no measured UDP loss, receiver throughput was 73.5 Mbit/s, close to the configured 75 Mbit/s sending rate. The reliable-UDP transfer completed faster with MTU 9001. The 719 Kbit/s TCP result at MTU 9001 was caused by TBF queue behavior: jumbo packets consumed most of the available burst at once, causing extra queueing/drops and TCP retransmissions, which sharply reduced throughput.
+
+![Case 3 reliable UDP, MTU 1500](images/part2/case3_mtu1500_custom_transfer_sender.png)
+
+![Case 3 reliable UDP, MTU 9001](images/part2/case3_mtu9001_custom_transfer_sender.png)
+
+## 3. Comparison with Lab 2
+
+The following table compares reliable-UDP file transfers with the results in the Lab 2 report. Throughput is file goodput, calculated from file size divided by total transfer time.
+
+| Case | MTU | Lab 2 time (s) | AWS time (s) | Lab 2 goodput (Mbit/s) | AWS goodput (Mbit/s) | Goodput change |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 1500 | 97.539 | 97.527 | 88.066 | 88.078 | ~0% |
+| 1 | 9001 | 94.692 | 91.288 | 90.714 | 94.097 | +3.7% |
+| 2 | 1500 | 170.754 | 152.192 | 50.306 | 56.442 | +12.2% |
+| 2 | 9001 | 158.518 | 146.011 | 54.189 | 58.831 | +8.6% |
+| 3 | 1500 | 115.597 | 120.838 | 74.309 | 71.087 | −4.3% |
+| 3 | 9001 | 111.600 | 116.318 | 76.971 | 73.849 | −4.1% |
+
+AWS performance was similar or better in Case 1, improved by about 9–12% in Case 2, and was about 4% lower in Case 3. MTU 9001 shortened transfer time in every case in both environments. AWS Case 2 retransmissions decreased from 435,200 to 430,572 at MTU 1500 and from 85,230 to 68,045 at MTU 9001. These are individual runs, so the differences cannot be attributed to the platform alone.
+
+Lab 2 verified all received files using MD5. In the provided AWS integrity check, both the original `data.bin` and the received `received.bin` had MD5 `65d30222f2668c9552382240d5c947a5`, confirming that the received file matched the original. The sender results also show that all data packets were acknowledged in every case.
+
+## 4. Conclusion
+
+The Lab 2 file-transfer program ran successfully on AWS and acknowledged all data packets in every case. It sustained 71–94 Mbit/s on the low-loss paths and remained at 56–59 Mbit/s on the high-delay, lossy path, where TCP fell to Kbit/s-level throughput. MTU 9001 generally reduced transfer time, but the benefit depends on the path condition.
