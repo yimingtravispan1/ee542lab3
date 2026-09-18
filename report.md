@@ -454,3 +454,582 @@ At approximately 200 ms RTT:
 0% loss  -> 40.4 Mbit/s
 5% loss  -> 0.308 Mbit/s
 20% loss -> 0.092 Mbit/s
+## 3. Custom Linux Kernel Build
+
+To modify the Linux TCP stack, a custom Ubuntu AWS kernel was built and installed on the Client.
+
+The original Client kernel was:
+
+```text
+6.17.0-1017-aws
+```
+
+The modified kernel was built with a separate ABI:
+
+```text
+6.17.0-999-aws
+```
+
+Using a separate ABI allowed the original AWS kernel to remain installed as a fallback in case the modified kernel failed to boot.
+
+The modified kernel was verified after reboot with:
+
+```bash
+uname -r
+```
+
+Expected output:
+
+```text
+6.17.0-999-aws
+```
+
+The TCP implementation files used in this experiment are located under:
+
+```text
+net/ipv4/
+```
+
+The two main files modified were:
+
+```text
+net/ipv4/tcp_timer.c
+net/ipv4/tcp_bbr.c
+```
+
+The implementation was completed in two main attempts:
+
+1. Remove exponential retransmission timeout backoff.
+2. Preserve a larger BBR congestion window under random link loss.
+
+The corresponding patches are stored in:
+
+```text
+kernel_modification/patches/
+```
+
+---
+
+## 4. Attempt 1 — Removing Exponential RTO Backoff
+
+### 4.1 Motivation
+
+Standard TCP assumes that packet loss may be caused by network congestion.
+
+When retransmission timeouts occur repeatedly, the retransmission timeout can grow exponentially:
+
+```text
+RTO
+2 × RTO
+4 × RTO
+8 × RTO
+...
+```
+
+This behavior is useful when packet loss is caused by congestion because it reduces the sending rate and prevents congestion collapse.
+
+However, in this experiment, packet loss was intentionally introduced using `tc netem` to represent an unreliable link. Therefore, reducing the sending rate after every timeout may not be the appropriate response.
+
+The first modification followed the idea from *Removing Exponential Back-off from TCP*.
+
+---
+
+### 4.2 Modification
+
+The first modification was made in:
+
+```text
+net/ipv4/tcp_timer.c
+```
+
+inside the TCP retransmission timeout path.
+
+For established TCP connections, the backoff counter was reset and the RTO was recalculated using the normal RTT-based estimator:
+
+```c
+if (sk->sk_state == TCP_ESTABLISHED) {
+    icsk->icsk_backoff = 0;
+    icsk->icsk_rto = clamp(__tcp_set_rto(tp),
+                           tcp_rto_min(sk),
+                           tcp_rto_max(sk));
+}
+```
+
+Conceptually, the timeout behavior changes from:
+
+```text
+RTO -> 2RTO -> 4RTO -> 8RTO -> ...
+```
+
+to:
+
+```text
+RTO -> RTO -> RTO -> RTO -> ...
+```
+
+while still using Linux's RTT-based RTO calculation.
+
+The corresponding patch is:
+
+```text
+kernel_modification/patches/0001-remove-exponential-rto-backoff.patch
+```
+
+---
+
+### 4.3 Result with CUBIC
+
+The modified kernel was first tested using the default CUBIC congestion-control algorithm.
+
+Test condition:
+
+| Parameter | Value |
+|---|---:|
+| Bottleneck rate | 100 Mbit/s |
+| RTT | ≈ 200 ms |
+| Random loss | 20% per direction |
+| Congestion control | CUBIC |
+
+Observed result:
+
+| Metric | Result |
+|---|---:|
+| Sender throughput | 17.5 Kbit/s |
+| Receiver throughput | 22.5 Kbit/s |
+| Retransmissions | 35 |
+| Minimum observed congestion window | ≈ 1.41 KB |
+
+The transfer contained many long intervals with:
+
+```text
+0.00 bit/s
+```
+
+The congestion window eventually decreased to approximately:
+
+```text
+1.41 KB
+```
+
+which is close to one TCP MSS.
+
+Therefore, removing exponential RTO backoff alone did not improve performance sufficiently.
+
+Although the timeout backoff was removed, CUBIC still reacted to random packet loss by significantly reducing the congestion window.
+
+This suggested that congestion-control behavior was another major bottleneck.
+
+---
+
+## 5. Congestion-Control Comparison
+
+To determine whether a different congestion-control algorithm could perform better under random link loss, several Linux TCP congestion-control modules were tested.
+
+Available algorithms included:
+
+```text
+reno
+cubic
+bbr
+westwood
+hybla
+```
+
+They were loaded using Linux's pluggable congestion-control interface.
+
+For example:
+
+```bash
+sudo modprobe tcp_bbr
+sudo modprobe tcp_westwood
+sudo modprobe tcp_hybla
+```
+
+The available algorithms were verified using:
+
+```bash
+sysctl net.ipv4.tcp_available_congestion_control
+```
+
+Among the tested algorithms, **BBR produced the highest throughput** under the high-delay, high-loss condition.
+
+---
+
+### 5.1 Attempt 1 with BBR
+
+BBR was enabled using:
+
+```bash
+sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+```
+
+The same network condition was used:
+
+| Parameter | Value |
+|---|---:|
+| Bottleneck rate | 100 Mbit/s |
+| RTT | ≈ 200 ms |
+| Random loss | 20% per direction |
+| RTO modification | Exponential backoff removed |
+| Congestion control | BBR |
+
+Observed result:
+
+| Metric | Result |
+|---|---:|
+| Sender throughput | 1.42 Mbit/s |
+| Receiver throughput | 1.25 Mbit/s |
+| Retransmissions | 1598 |
+
+Compared with the modified CUBIC result:
+
+```text
+22.5 Kbit/s
+      ↓
+1.25 Mbit/s
+```
+
+the receiver throughput increased by more than one order of magnitude.
+
+The congestion window also remained much larger than with CUBIC, typically staying in the range of several tens of kilobytes rather than collapsing to approximately one MSS.
+
+This showed that congestion-control behavior was a major factor in addition to retransmission timeout backoff.
+
+However, the transfer still contained many intervals with no useful data transmission.
+
+---
+
+## 6. Attempt 2 — BBR Congestion-Window Floor
+
+### 6.1 Motivation
+
+BBR significantly improved throughput, but the congestion window could still become relatively small during severe random packet loss.
+
+The second modification therefore attempted to preserve a larger amount of data in flight.
+
+For a target throughput of 10 Mbit/s with approximately 200 ms RTT, the bandwidth-delay product is:
+
+```text
+10 Mbit/s × 0.2 s = 2 Mbit
+```
+
+which is approximately:
+
+```text
+250 KB
+```
+
+This suggested that maintaining a congestion window of several hundred kilobytes could help prevent excessive link under-utilization.
+
+---
+
+### 6.2 BBR Modification
+
+The second modification was made in:
+
+```text
+net/ipv4/tcp_bbr.c
+```
+
+A configurable minimum congestion-window value was added:
+
+```c
+static unsigned int bbr_lossy_cwnd_floor = 256;
+
+module_param(bbr_lossy_cwnd_floor, uint, 0644);
+
+MODULE_PARM_DESC(
+    bbr_lossy_cwnd_floor,
+    "Minimum BBR cwnd in packets for EE542 lossy-link experiments"
+);
+```
+
+During normal BBR operation:
+
+```c
+if (bbr->mode != BBR_PROBE_RTT)
+    cwnd = max_t(u32, cwnd,
+                 READ_ONCE(bbr_lossy_cwnd_floor));
+```
+
+The configured value used in the experiment was:
+
+```text
+256 MSS
+```
+
+Assuming an MSS of approximately 1460 bytes:
+
+```text
+256 × 1460 ≈ 374 KB
+```
+
+The original BBR `PROBE_RTT` behavior was left unchanged.
+
+The corresponding patch is:
+
+```text
+kernel_modification/patches/0002-bbr-lossy-cwnd-floor.patch
+```
+
+---
+
+### 6.3 Incremental BBR Module Build
+
+Because BBR is implemented as a loadable Linux kernel module, the second modification did not require rebuilding the complete kernel.
+
+Only:
+
+```text
+tcp_bbr.ko
+```
+
+was rebuilt.
+
+The module was compiled incrementally using the existing kernel build tree.
+
+The modified module was then loaded into the already-running:
+
+```text
+6.17.0-999-aws
+```
+
+kernel.
+
+The new runtime parameter was verified using:
+
+```bash
+cat /sys/module/tcp_bbr/parameters/bbr_lossy_cwnd_floor
+```
+
+Expected output:
+
+```text
+256
+```
+
+This also allowed the congestion-window floor to be changed at runtime without rebuilding the module again.
+
+---
+
+### 6.4 Attempt 2 Result
+
+The same network condition was used for comparison:
+
+| Parameter | Value |
+|---|---:|
+| Bottleneck rate | 100 Mbit/s |
+| RTT | ≈ 200 ms |
+| Random loss | 20% per direction |
+| RTO modification | Exponential backoff removed |
+| Congestion control | BBR |
+| Minimum cwnd | 256 MSS |
+
+Observed result:
+
+| Metric | Result |
+|---|---:|
+| Sender throughput | 3.15 Mbit/s |
+| Receiver throughput | 2.17 Mbit/s |
+| Retransmissions | 3626 |
+| Typical congestion window | ≈ 362 KB |
+
+The measured congestion window remained close to the configured minimum:
+
+```text
+≈ 362 KB
+```
+
+which confirmed that the new BBR modification was active.
+
+Receiver throughput increased from:
+
+```text
+1.25 Mbit/s
+```
+
+with normal BBR to:
+
+```text
+2.17 Mbit/s
+```
+
+with the BBR congestion-window floor.
+
+This represents approximately a:
+
+```text
+74% improvement
+```
+
+over the previous BBR result.
+
+However, the transfer still contained repeated zero-throughput intervals followed by short bursts of successful transmission.
+
+Therefore, increasing the congestion window improved throughput but did not fully eliminate the loss-recovery problem.
+
+---
+
+## 7. Modified TCP Results Summary
+
+All measurements in the following table were obtained under approximately:
+
+```text
+100 Mbit/s bottleneck
+200 ms RTT
+20% random packet loss per direction
+```
+
+| Configuration | RTO Behavior | Congestion Control | Additional Modification | Sender Throughput | Receiver Throughput |
+|---|---|---|---|---:|---:|
+| Standard TCP baseline | Default exponential backoff | CUBIC | None | — | 0.092 Mbit/s |
+| Attempt 1 | Backoff removed | CUBIC | None | 0.0175 Mbit/s | 0.0225 Mbit/s |
+| Attempt 1 + BBR | Backoff removed | BBR | None | 1.42 Mbit/s | 1.25 Mbit/s |
+| Attempt 2 | Backoff removed | BBR | 256-MSS cwnd floor | 3.15 Mbit/s | 2.17 Mbit/s |
+
+The optimization process can be summarized as:
+
+```text
+Standard TCP + CUBIC
+~0.092 Mbit/s
+        |
+        | Remove exponential RTO backoff
+        v
+No-backoff + CUBIC
+~0.0225 Mbit/s
+        |
+        | Change congestion control
+        v
+No-backoff + BBR
+~1.25 Mbit/s
+        |
+        | Add 256-MSS congestion-window floor
+        v
+Modified BBR
+~2.17 Mbit/s
+```
+
+---
+
+## 8. Discussion
+
+The experiments show that poor TCP performance over the emulated lossy link is caused by more than one TCP mechanism.
+
+### Effect of RTT
+
+The baseline measurements showed that increasing RTT alone causes a gradual reduction in throughput.
+
+With no packet loss:
+
+```text
+20 ms RTT  -> 95.3 Mbit/s
+200 ms RTT -> 40.4 Mbit/s
+```
+
+Even at approximately 200 ms RTT, standard TCP was still able to achieve significant throughput.
+
+Therefore, high latency alone was not the main cause of the observed TCP collapse.
+
+### Effect of Packet Loss
+
+Random packet loss had a much larger impact.
+
+At approximately 200 ms RTT:
+
+```text
+0% loss  -> 40.4 Mbit/s
+5% loss  -> 0.308 Mbit/s
+20% loss -> 0.092 Mbit/s
+```
+
+Only 5% random loss per direction reduced throughput by more than two orders of magnitude.
+
+This indicates that TCP's response to packet loss was the main performance problem in the experiment.
+
+### Effect of Removing Exponential Backoff
+
+Removing exponential RTO backoff reduced the amount of additional waiting introduced after retransmission timeouts.
+
+However, the CUBIC congestion window still collapsed to approximately one MSS.
+
+As a result, removing exponential backoff alone did not improve performance.
+
+### Effect of BBR
+
+Switching from CUBIC to BBR increased receiver throughput from approximately:
+
+```text
+0.0225 Mbit/s
+```
+
+to:
+
+```text
+1.25 Mbit/s
+```
+
+This was the largest single improvement observed during the experiments.
+
+The result suggests that the loss-based response used by CUBIC is poorly suited to this controlled lossy-link environment, because random loss does not necessarily indicate network congestion.
+
+### Effect of the BBR Congestion-Window Floor
+
+Adding the 256-MSS congestion-window floor increased receiver throughput further:
+
+```text
+1.25 Mbit/s
+      ↓
+2.17 Mbit/s
+```
+
+and kept the congestion window near:
+
+```text
+362 KB
+```
+
+This confirmed that preserving a larger congestion window improved link utilization.
+
+However, a large number of retransmissions and long zero-throughput periods remained.
+
+Therefore, once the congestion window was sufficiently large, the remaining bottleneck appeared to be TCP retransmission and loss-recovery behavior rather than congestion-window size alone.
+
+---
+
+## 9. Conclusion
+
+This part extended the AWS networking and reliable file-transfer experiments by modifying the Linux TCP implementation itself.
+
+The work included:
+
+- Measuring standard TCP performance across different RTT and packet-loss conditions
+- Building and installing a custom Ubuntu AWS kernel
+- Preserving the original AWS kernel as a fallback
+- Removing exponential RTO backoff for established TCP connections
+- Testing multiple Linux congestion-control algorithms
+- Identifying BBR as the best-performing available congestion-control algorithm
+- Adding a configurable BBR congestion-window floor
+- Rebuilding and loading the modified `tcp_bbr.ko` module incrementally
+- Comparing the performance of all tested TCP configurations
+
+The baseline measurements demonstrated that random packet loss had a much stronger effect on TCP throughput than RTT alone.
+
+The first modification showed that removing exponential RTO backoff by itself was insufficient because CUBIC still reduced the congestion window aggressively.
+
+Using BBR increased receiver throughput to approximately:
+
+```text
+1.25 Mbit/s
+```
+
+and the second BBR modification increased it further to approximately:
+
+```text
+2.17 Mbit/s
+```
+
+under the approximately 200 ms RTT and 20% bidirectional loss condition.
+
+Although the result remained below the final 10 Mbit/s target, the experiments identified the main TCP performance bottlenecks and demonstrated measurable improvements from both congestion-control selection and congestion-window preservation.
+
+The remaining performance limitation appears to be primarily related to retransmission and loss-recovery behavior under severe random packet loss.
