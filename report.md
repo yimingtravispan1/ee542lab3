@@ -353,3 +353,104 @@ Lab 2 verified all received files using MD5. In the provided AWS integrity check
 ## 4. Conclusion
 
 The Lab 2 file-transfer program ran successfully on AWS and acknowledged all data packets in every case. It sustained 71–94 Mbit/s on the low-loss paths and remained at 56–59 Mbit/s on the high-delay, lossy path, where TCP fell to Kbit/s-level throughput. MTU 9001 generally reduced transfer time, but the benefit depends on the path condition.
+# Part 3 — TCP Congestion Control Modification
+
+## 1. Objective
+
+After completing the AWS network experiments and the reliable-UDP file-transfer tests in Parts 1 and 2, the same AWS Client–VyOS–Server topology was reused to study TCP performance over high-latency and lossy links.
+
+The goal of this part was to determine why standard Linux TCP performs poorly when packet loss is caused by an unreliable link rather than actual network congestion, and then modify the Linux TCP stack to improve performance.
+
+Unless otherwise noted, the TCP measurements in this section used:
+
+- **Bottleneck rate:** 100 Mbit/s
+- **Client:** `10.0.1.91`
+- **Server:** `10.0.2.177`
+- **Router:** VyOS
+- **Baseline kernel:** Ubuntu 24.04.4, `6.17.0-1017-aws`
+- **Modified kernel:** `6.17.0-999-aws`
+- **Measurement tool:** `iperf3`
+
+The same static routing and VyOS traffic-shaping configuration described in Part 1 were reused.
+
+---
+
+## 2. Standard TCP Performance
+
+Before modifying the Linux kernel, standard TCP performance was measured over a 100 Mbit/s link under different RTT and packet-loss conditions.
+
+Three groups of measurements were performed:
+
+1. Vary packet loss while keeping RTT low.
+2. Vary RTT while keeping packet loss at 0%.
+3. Vary packet loss while keeping RTT near 200 ms.
+
+---
+
+### 2.1 Packet Loss with Fixed RTT ≈ 20 ms
+
+RTT was kept near 20 ms while random packet loss was increased in both directions.
+
+| Packet loss per direction | TCP throughput |
+|---:|---:|
+| 0% | 95.3 Mbit/s |
+| 5% | 1.88 Mbit/s |
+| 10% | 0.94 Mbit/s |
+| 15% | 0.31 Mbit/s |
+| 20% | 0.10 Mbit/s |
+| 25% | 0.01 Mbit/s |
+
+With no packet loss, standard TCP reached approximately 95 Mbit/s, close to the configured 100 Mbit/s bottleneck rate.
+
+However, even a small amount of random loss caused a severe throughput reduction. At only 5% loss per direction, throughput decreased from 95.3 Mbit/s to 1.88 Mbit/s.
+
+This result shows that standard TCP is highly sensitive to random packet loss even when RTT is relatively small.
+
+---
+
+### 2.2 RTT with Fixed 0% Packet Loss
+
+Packet loss was kept at 0% while RTT was increased from approximately 20 ms to 200 ms.
+
+| RTT | TCP throughput |
+|---:|---:|
+| 20 ms | 95.3 Mbit/s |
+| 40 ms | 93.3 Mbit/s |
+| 60 ms | 91.7 Mbit/s |
+| 80 ms | 89.4 Mbit/s |
+| 100 ms | 86.0 Mbit/s |
+| 120 ms | 70.7 Mbit/s |
+| 140 ms | 60.5 Mbit/s |
+| 160 ms | 51.8 Mbit/s |
+| 180 ms | 47.3 Mbit/s |
+| 200 ms | 40.4 Mbit/s |
+
+Increasing RTT alone reduced TCP throughput gradually.
+
+Even at approximately 200 ms RTT, TCP still achieved about 40.4 Mbit/s when there was no packet loss.
+
+This indicates that high RTT reduces TCP efficiency, but latency alone does not explain the severe throughput collapse observed in the lossy-link experiments.
+
+---
+
+### 2.3 Packet Loss with Fixed RTT ≈ 200 ms
+
+RTT was then fixed near 200 ms while packet loss was increased.
+
+| Packet loss per direction | TCP throughput |
+|---:|---:|
+| 0% | 40.4 Mbit/s |
+| 5% | 0.308 Mbit/s |
+| 10% | 0.103 Mbit/s |
+| 15% | 0.0999 Mbit/s |
+| 20% | 0.092 Mbit/s |
+| 25% | 0.043 Mbit/s |
+
+The combination of high RTT and random loss produced the most severe TCP performance degradation.
+
+At approximately 200 ms RTT:
+
+```text
+0% loss  -> 40.4 Mbit/s
+5% loss  -> 0.308 Mbit/s
+20% loss -> 0.092 Mbit/s
