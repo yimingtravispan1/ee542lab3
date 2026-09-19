@@ -355,6 +355,9 @@ Lab 2 verified all received files using MD5. In the provided AWS integrity check
 The Lab 2 file-transfer program ran successfully on AWS and acknowledged all data packets in every case. It sustained 71–94 Mbit/s on the low-loss paths and remained at 56–59 Mbit/s on the high-delay, lossy path, where TCP fell to Kbit/s-level throughput. MTU 9001 generally reduced transfer time, but the benefit depends on the path condition.
 # Part 3 — TCP Congestion Control Modification
 
+## Initial Experiment Results
+![TCP initial experiment results](images/part3tests.png)
+
 ## 1. Objective
 
 After completing the AWS network experiments and the reliable-UDP file-transfer tests in Parts 1 and 2, the same AWS Client–VyOS–Server topology was reused to study TCP performance over high-latency and lossy links.
