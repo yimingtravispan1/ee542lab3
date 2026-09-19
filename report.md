@@ -871,9 +871,102 @@ However, the transfer still contained repeated zero-throughput intervals followe
 
 Therefore, increasing the congestion window improved throughput but did not fully eliminate the loss-recovery problem.
 
+## 7. Attempt 3 — Loss-Tolerant BBR Pacing
+
+### 7.1 Motivation
+
+The original BBR implementation used the following long-term loss threshold:
+
+```c
+static const u32 bbr_lt_loss_thresh = 50;
+```
+
+The value is scaled by `BBR_UNIT = 256`, so it represents approximately 19.5% loss:
+
+```text
+50 / 256 ≈ 19.5%
+```
+
+The experimental link applied 20% random loss per direction. Consequently, BBR could classify the random link loss as evidence of bandwidth policing and adopt a very low long-term bandwidth estimate. The 256-packet cwnd floor prevented window collapse but did not prevent the pacing rate from following this low estimate.
+
+### 7.2 Modifications
+
+Three related changes were made in `net/ipv4/tcp_bbr.c`.
+
+First, the cwnd floor was raised from 256 to 384 packets:
+
+```c
+static unsigned int bbr_lossy_cwnd_floor = 384;
+```
+
+At an MSS of 1,448 bytes and 200 ms RTT, this permits approximately:
+
+```text
+384 × 1448 × 8 / 0.2 ≈ 22.2 Mbit/s
+```
+
+Second, the long-term loss threshold was made configurable and raised to 50%:
+
+```c
+static unsigned int bbr_lt_loss_thresh = 128;
+module_param(bbr_lt_loss_thresh, uint, 0644);
+```
+
+Because `128/256 = 50%`, the experiment's 20% random loss no longer crosses the policer-detection threshold.
+
+Third, a configurable 20 Mbit/s pacing floor was added:
+
+```c
+static unsigned int bbr_lossy_pacing_floor_mbps = 20;
+module_param(bbr_lossy_pacing_floor_mbps, uint, 0644);
+```
+
+The pacing-rate update enforces the floor during normal BBR operation:
+
+```c
+if (bbr->mode != BBR_PROBE_RTT &&
+    READ_ONCE(bbr_lossy_pacing_floor_mbps)) {
+    floor_rate =
+        (unsigned long)READ_ONCE(
+            bbr_lossy_pacing_floor_mbps) *
+        1000000UL / 8;
+
+    floor_rate = min(floor_rate,
+                     READ_ONCE(sk->sk_max_pacing_rate));
+    rate = max(rate, floor_rate);
+}
+```
+
+This preserves `BBR_PROBE_RTT`, respects the socket's maximum pacing rate, and only raises the rate when BBR's estimate falls below the configured floor. The corresponding patch is `0003-ee542-bbr-lossy-pacing.patch`.
+
+Runtime parameters were verified as:
+
+```text
+bbr_lossy_cwnd_floor:        384
+bbr_lossy_pacing_floor_mbps: 20
+bbr_lt_loss_thresh:          128
+```
+
+### 7.3 Attempt 3 results
+
+VyOS applied a 100 Mbit/s TBF and `netem delay 100ms loss 20%` on each egress direction. The Client and Server routes were verified to traverse VyOS. A pre-test ping measured an average RTT of approximately 200.573 ms.
+
+Socket buffer limits were raised on both endpoints to permit the 8 MiB request.
+
+| Metric | Result |
+|---|---:|
+| Sender transfer | 218 MBytes |
+| Sender throughput | 14.0 Mbit/s |
+| Receiver transfer | 217 MBytes |
+| **Receiver throughput** | **13.1 Mbit/s** |
+| Retransmissions | 40,579 |
+| Test duration | Approximately 120 s |
+
+The receiver throughput exceeded the 10 Mbit/s target by 5.1 Mbit/s, or approximately 51%. The high retransmission count was expected because the impairment intentionally discarded 20% of packets in each direction.
+
 ---
 
-## 7. Modified TCP Results Summary
+## 8. Modified TCP Results Summary
 
 All measurements in the following table were obtained under approximately:
 
@@ -889,6 +982,7 @@ All measurements in the following table were obtained under approximately:
 | Attempt 1 | Backoff removed | CUBIC | None | 0.0175 Mbit/s | 0.0225 Mbit/s |
 | Attempt 1 + BBR | Backoff removed | BBR | None | 1.42 Mbit/s | 1.25 Mbit/s |
 | Attempt 2 | Backoff removed | BBR | 256-MSS cwnd floor | 3.15 Mbit/s | 2.17 Mbit/s |
+| Attempt 3 | Backoff removed | BBR | 384-MSS cwnd floor | 14.0 Mbit/s | 13.1 Mbit/s |
 
 The optimization process can be summarized as:
 
@@ -910,11 +1004,19 @@ No-backoff + BBR
         v
 Modified BBR
 ~2.17 Mbit/s
+        |
+        | Changed congestion-window floor to 384-MSS
+        | Changed long-term loss threshold to 50%
+        | Added pacing floor of 20 Mbps
+        |
+        v
+Modified BBR
+~13.1 Mbit/s
 ```
 
 ---
 
-## 8. Discussion
+## 9. Discussion
 
 The experiments show that poor TCP performance over the emulated lossy link is caused by more than one TCP mechanism.
 
@@ -971,7 +1073,7 @@ to:
 1.25 Mbit/s
 ```
 
-This was the largest single improvement observed during the experiments.
+This was a huge improvement observed during the experiments.
 
 The result suggests that the loss-based response used by CUBIC is poorly suited to this controlled lossy-link environment, because random loss does not necessarily indicate network congestion.
 
@@ -997,9 +1099,13 @@ However, a large number of retransmissions and long zero-throughput periods rema
 
 Therefore, once the congestion window was sufficiently large, the remaining bottleneck appeared to be TCP retransmission and loss-recovery behavior rather than congestion-window size alone.
 
+Attempt 3 addressed the remaining pacing bottleneck. Raising the long-term loss threshold prevented 20% random loss from being interpreted as policing, while the pacing floor ensured continued transmission when the estimated bandwidth fell too low. The larger cwnd provided sufficient in-flight capacity for the target bandwidth-delay product. Together, these changes produced 15.1 Mbit/s receiver throughput.
+
+The final result is a controlled optimization for the lab environment. A mandatory pacing floor can be unsafe on a genuinely congested shared network because it can continue injecting traffic despite congestion. The modification should therefore be described as an experimental lossy-link mechanism rather than a general-purpose replacement for standard BBR behavior. Additional repeated runs and fairness tests against competing flows would be required before drawing broader conclusions.
+
 ---
 
-## 9. Conclusion
+## 10. Conclusion
 
 This part extended the AWS networking and reliable file-transfer experiments by modifying the Linux TCP implementation itself.
 
@@ -1012,6 +1118,7 @@ The work included:
 - Testing multiple Linux congestion-control algorithms
 - Identifying BBR as the best-performing available congestion-control algorithm
 - Adding a configurable BBR congestion-window floor
+- Modified long-term loss thresholds and added 20 Mbps pacing floor
 - Rebuilding and loading the modified `tcp_bbr.ko` module incrementally
 - Comparing the performance of all tested TCP configurations
 
@@ -1031,8 +1138,10 @@ and the second BBR modification increased it further to approximately:
 2.17 Mbit/s
 ```
 
+the final BBR modification met the requirements and increased it to:
+
+```text
+13.1 Mbit/s
+```
+
 under the approximately 200 ms RTT and 20% bidirectional loss condition.
-
-Although the result remained below the final 10 Mbit/s target, the experiments identified the main TCP performance bottlenecks and demonstrated measurable improvements from both congestion-control selection and congestion-window preservation.
-
-The remaining performance limitation appears to be primarily related to retransmission and loss-recovery behavior under severe random packet loss.
