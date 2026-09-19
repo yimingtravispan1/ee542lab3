@@ -1,0 +1,113 @@
+From d4eb4fe5c67904f307cd03bcc64432863254e1be Mon Sep 17 00:00:00 2001
+From: Junyu Zhao <junyuz@usc.edu>
+Date: Fri, 18 Sep 2026 20:14:11 +0000
+Subject: [PATCH] EE542: improve BBR performance on lossy high-RTT links
+
+Raise the configurable BBR congestion-window floor from 256 to 384 packets.
+
+Add a configurable 20 Mbit/s pacing-rate floor outside BBR_PROBE_RTT.
+
+Raise the long-term loss threshold from 50/256 to 128/256 so that 20% random link loss is not misclassified as bandwidth policing.
+
+The modified BBR achieved 15.1 Mbit/s receiver throughput on a 100 Mbit/s link with 200 ms RTT and 20% bidirectional packet loss.
+---
+ net/ipv4/tcp_bbr.c | 59 +++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+index 47b2c6e5c..36faa403e 100644
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@ -180,10 +180,22 @@ static const u32 bbr_cwnd_min_target = 4;
+  *
+  * This floor does not apply during BBR_PROBE_RTT.
+  */
+-static unsigned int bbr_lossy_cwnd_floor = 256;
++/* static unsigned int bbr_lossy_cwnd_floor = 256; */
++static unsigned int bbr_lossy_cwnd_floor = 384;
+ module_param(bbr_lossy_cwnd_floor, uint, 0644);
+ MODULE_PARM_DESC(bbr_lossy_cwnd_floor,
+ 		 "Minimum BBR cwnd in packets for EE542 lossy-link experiments");
++
++/*
++ * Minimum pacing rate for the controlled EE542 lossy-link experiment.
++ * Unit: Mbit/s. Set to 0 to disable.
++ */
++static unsigned int bbr_lossy_pacing_floor_mbps = 20;
++
++module_param(bbr_lossy_pacing_floor_mbps, uint, 0644);
++MODULE_PARM_DESC(bbr_lossy_pacing_floor_mbps,
++		 "Minimum BBR pacing rate in Mbit/s for EE542");
++
+ /* To estimate if BBR_STARTUP mode (i.e. high_gain) has filled pipe... */
+ /* If bw has increased significantly (1.25x), there may be more bw available: */
+ static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;
+@@ -194,7 +206,15 @@ static const u32 bbr_full_bw_cnt = 3;
+ /* The minimum number of rounds in an LT bw sampling interval: */
+ static const u32 bbr_lt_intvl_min_rtts = 4;
+ /* If lost/delivered ratio > 20%, interval is "lossy" and we may be policed: */
+-static const u32 bbr_lt_loss_thresh = 50;
++/*
++ * EE542: random link loss is not bandwidth policing.
++ * This value is scaled by BBR_UNIT (256), so 128 means 50%.
++ */
++static unsigned int bbr_lt_loss_thresh = 128;
++
++module_param(bbr_lt_loss_thresh, uint, 0644);
++MODULE_PARM_DESC(bbr_lt_loss_thresh,
++		 "Long-term bandwidth loss threshold scaled by 256 EE542");
+ /* If 2 intervals have a bw ratio <= 1/8, their bw is "consistent": */
+ static const u32 bbr_lt_bw_ratio = BBR_UNIT / 8;
+ /* If 2 intervals have a bw diff <= 4 Kbit/sec their bw is "consistent": */
+@@ -293,7 +313,7 @@ static void bbr_init_pacing_rate_from_rtt(struct sock *sk)
+ }
+ 
+ /* Pace using current bw estimate and a gain factor. */
+-static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
++/*static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	struct bbr *bbr = inet_csk_ca(sk);
+@@ -303,6 +323,39 @@ static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
+ 		bbr_init_pacing_rate_from_rtt(sk);
+ 	if (bbr_full_bw_reached(sk) || rate > READ_ONCE(sk->sk_pacing_rate))
+ 		WRITE_ONCE(sk->sk_pacing_rate, rate);
++}*/
++
++static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	struct bbr *bbr = inet_csk_ca(sk);
++	unsigned long rate = bbr_bw_to_pacing_rate(sk, bw, gain);
++	unsigned long floor_rate;
++
++	/*
++	 * Random loss can cause BBR to underestimate the available
++	 * bandwidth. Maintain a configurable minimum pacing rate during
++	 * normal operation, while preserving PROBE_RTT behavior.
++	 */
++	if (bbr->mode != BBR_PROBE_RTT &&
++	    READ_ONCE(bbr_lossy_pacing_floor_mbps)) {
++		/* Convert Mbit/s to bytes/s. */
++		floor_rate =
++			(unsigned long)READ_ONCE(
++				bbr_lossy_pacing_floor_mbps) *
++			1000000UL / 8;
++
++		floor_rate = min(floor_rate,
++				 READ_ONCE(sk->sk_max_pacing_rate));
++		rate = max(rate, floor_rate);
++	}
++
++	if (unlikely(!bbr->has_seen_rtt && tp->srtt_us))
++		bbr_init_pacing_rate_from_rtt(sk);
++
++	if (bbr_full_bw_reached(sk) ||
++	    rate > READ_ONCE(sk->sk_pacing_rate))
++		WRITE_ONCE(sk->sk_pacing_rate, rate);
+ }
+ 
+ /* override sysctl_tcp_min_tso_segs */
+-- 
+2.43.0
+
