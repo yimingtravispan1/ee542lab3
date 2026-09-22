@@ -1,5 +1,13 @@
 # EE 542 Lab 3 Report
 
+## Team Contributions
+
+| Member | Work (from Git commit history) |
+|---|---|
+| yxia | Completed the Part 1 and Part 2 reports; collected and added the corresponding experiment figures; updated the project README. |
+| Paralyz3dz | Developed the Part 3 TCP congestion-control study, including the baseline measurements, kernel-build documentation, RTO/BBR modification analysis, and related patches. |
+| yimingtravispan1 | Added Part 3 test evidence and code patches; completed the final Part 3 update, including the loss-tolerant BBR pacing experiment and results. |
+
 ## Part 1 — AWS Network Performance Experiments
 
 ### 1. AWS Network Topology
