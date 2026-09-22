@@ -2,7 +2,7 @@
 
 ## Team Contributions
 
-| Member | Work (from Git commit history) |
+| Member | Work |
 |---|---|
 | yxia | Completed the Part 1 and Part 2 reports; collected and added the corresponding experiment figures; updated the project README. |
 | Paralyz3dz | Developed the Part 3 TCP congestion-control study, including the baseline measurements, kernel-build documentation, RTO/BBR modification analysis, and related patches. |
